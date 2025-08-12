@@ -27,6 +27,11 @@ import { Input } from "@/components/ui/input"
 // Helia (IPFS) for file sharing
 import { createHelia, type Helia } from "helia"
 import { unixfs } from "@helia/unixfs"
+import { createLibp2p } from "libp2p"
+import { webTransport } from "@libp2p/webtransport"
+import { webSockets } from "@libp2p/websockets"
+import { bootstrap } from "@libp2p/bootstrap"
+import { delegatedHTTPRouting } from "@helia/routers"
 
 // Optional persistent blockstore (browser IndexedDB)
 let hasIDB = true
@@ -39,20 +44,41 @@ try {
 type IDBBlockstore = any
 
 async function createHeliaNode(): Promise<Helia> {
+  let blockstore: IDBBlockstore | undefined
   if (hasIDB) {
     try {
       // Dynamically import to avoid breaking environments without IDB
       const { IDBBlockstore } = await import("blockstore-idb")
-      const blockstore: IDBBlockstore = new IDBBlockstore("p2p-im-blocks")
+      blockstore = new IDBBlockstore("p2p-im-blocks")
       await blockstore.open()
-      // Persist blocks so your node "pins" while online and across reloads
-      return await createHelia({ blockstore })
     } catch (e) {
       console.warn("IDB blockstore unavailable, falling back to in-memory:", e)
     }
   }
-  // Fallback: in-memory (pins last until tab closes)
-  return await createHelia()
+
+  const libp2p = await createLibp2p({
+    transports: [webTransport(), webSockets()],
+    peerDiscovery: [
+      bootstrap({
+        list: [
+          "/dns4/node0.delegate.ipfs.io/tcp/443/wss/p2p/12D3KooWGaDo7oU5zWxZmfZbduCMsZbxTWdK5vCq1zg9ZDB6wq3J",
+        ],
+      }),
+    ],
+  })
+
+  libp2p.addEventListener("peer:connect", (evt) => {
+    console.log("libp2p connected to", evt.detail.toString())
+  })
+  libp2p.addEventListener("peer:disconnect", (evt) => {
+    console.log("libp2p disconnected from", evt.detail.toString())
+  })
+
+  return await createHelia({
+    blockstore,
+    libp2p,
+    routers: [delegatedHTTPRouting()],
+  })
 }
 
 // Markdown + syntax highlighting
@@ -397,14 +423,16 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
 
   // Send files via Helia (IPFS) – accepts an array of File
   const onPickFiles = async (files: File[]) => {
-    if (!files.length || !helia) return
+    if (!helia) return
+    const images = files.filter((f) => f.type.startsWith("image/"))
+    if (!images.length) return
     setIsUploading(true)
     try {
       const fs = unixfs(helia)
-      for (const file of files) {
+      for (const file of images) {
         try {
           const ab = await file.arrayBuffer()
-          const cid = await fs.addBytes(new Uint8Array(ab))
+          const cid = (await fs.addBytes(new Uint8Array(ab))).toV1().toString()
           const ts = Date.now()
           const id = `${ts}-${selfId}`
 
@@ -415,7 +443,7 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
             timestamp: ts,
             kind: "file",
             content: file.name || "Shared file",
-            cid: cid.toString(),
+            cid,
             mimeType: file.type || "application/octet-stream",
             fileName: file.name,
             fileSize: file.size,
@@ -430,7 +458,7 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
             name: myName,
             content: file.name || "Shared file",
             kind: "file",
-            cid: cid.toString(),
+            cid,
             mimeType: msg.mimeType,
             fileName: msg.fileName,
             fileSize: msg.fileSize,
@@ -441,6 +469,11 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
             console.error("failed to send file message", e)
           }
           gunNodeRef.current?.get(msg.id).put(msg)
+          try {
+            await fetch(gatewayFor(cid))
+          } catch (e) {
+            console.warn("prefetch failed", e)
+          }
         } catch (e) {
           console.error("IPFS add failed for a file:", e)
         }
@@ -560,7 +593,14 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
               onChangeMessage={setNewMessage}
               onOpenPicker={openFilePicker}
             />
-            <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFilesSelected} />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              multiple
+              onChange={handleFilesSelected}
+            />
           </main>
         </div>
 
@@ -669,21 +709,29 @@ function MessageRow({ message: m }: { message: ChatMessage }) {
   }
   const mine = m.authorId === selfId
   return (
-    <div className="space-y-1">
+    <div className={`space-y-1 max-w-[80%] ${mine ? "ml-auto text-right" : "mr-auto"}`}>
       <div className="text-xs text-emerald-300/70">
         {mine ? `${m.authorName} (You)` : m.authorName} •{" "}
         {new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </div>
-      {m.kind === "text" ? (
-        <MarkdownRenderer text={m.content} />
-      ) : (
-        <FileBubble
-          cid={m.cid}
-          fileName={m.fileName || m.content}
-          mimeType={m.mimeType}
-          fileSize={m.fileSize}
-        />
-      )}
+      <div
+        className={`rounded-lg px-3 py-2 shadow-md shadow-emerald-900/20 ${
+          mine
+            ? "bg-emerald-500 text-black"
+            : "bg-emerald-800/50 text-emerald-100"
+        }`}
+      >
+        {m.kind === "text" ? (
+          <MarkdownRenderer text={m.content} />
+        ) : (
+          <FileBubble
+            cid={m.cid}
+            fileName={m.fileName || m.content}
+            mimeType={m.mimeType}
+            fileSize={m.fileSize}
+          />
+        )}
+      </div>
     </div>
   )
 }
@@ -724,6 +772,9 @@ function FileBubble({
     } catch {}
   }
 
+  const [imgLoading, setImgLoading] = useState(true)
+  const [imgError, setImgError] = useState(false)
+
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 text-xs text-emerald-300/80">
@@ -741,12 +792,33 @@ function FileBubble({
       </div>
 
       {isImage && (
-        <img
-          src={url || "/placeholder.svg?height=300&width=500&query=hacker%20chat%20image%20preview"}
-          alt={fileName || "image"}
-          className="max-h-80 w-full rounded-lg border border-emerald-500/25 bg-black/20 object-contain shadow-[0_0_18px_rgba(34,211,238,.15)]"
-          crossOrigin="anonymous"
-        />
+        <>
+          {imgLoading && !imgError && (
+            <div className="flex h-48 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-emerald-300" />
+            </div>
+          )}
+          {!imgError && (
+            <img
+              src={url}
+              alt={fileName || "image"}
+              className={`max-h-80 w-full rounded-lg border border-emerald-500/25 bg-black/20 object-contain shadow-[0_0_18px_rgba(34,211,238,.15)] ${
+                imgLoading ? "hidden" : ""
+              }`}
+              crossOrigin="anonymous"
+              onLoad={() => setImgLoading(false)}
+              onError={() => {
+                setImgError(true)
+                setImgLoading(false)
+              }}
+            />
+          )}
+          {imgError && (
+            <div className="flex h-48 w-full items-center justify-center rounded-lg border border-emerald-500/25 bg-black/20 text-xs text-emerald-300/80">
+              Failed to load image
+            </div>
+          )}
+        </>
       )}
 
       {isVideo && (
