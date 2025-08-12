@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, no-constant-binary-expression, no-empty */
 import { useEffect, useMemo, useRef, useState } from "react"
-import { joinRoom, selfId, type JsonValue } from "trystero"
+import { selfId, type JsonValue } from "trystero"
+import { useTrysteroRoom } from "@/lib/trystero-client"
 import Gun from "gun"
 import {
   Send,
@@ -147,13 +148,17 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
 
   const sortMessages = (msgs: ChatMessage[]) => msgs.sort((a, b) => a.timestamp - b.timestamp)
 
+  // resolve room id and establish room with strategy fallbacks
+  const url = typeof window !== "undefined" ? new URL(window.location.href) : null
+  const paramRoom = url?.searchParams.get("room")
+  const roomId = isGeneral
+    ? "/chat/general"
+    : paramRoom || (typeof window !== "undefined" ? window.location.pathname : "/")
+  const room = useTrysteroRoom({ appId: "p2p-im" }, roomId)
+
   // Create/join room and wire Trystero + Gun subscriptions
   useEffect(() => {
-    const url = new URL(window.location.href)
-    const paramRoom = url.searchParams.get("room")
-    const roomId = isGeneral ? "/chat/general" : paramRoom || window.location.pathname
-
-    const room = joinRoom({ appId: "p2p-im" }, roomId)
+    if (!room) return
 
     // Gun path for this room
     const messagesNode = gun.get("chats").get(roomId)
@@ -287,11 +292,10 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
     })
 
     return () => {
-      room.leave()
       ;(messagesNode as any)?.off?.()
       ;(gunMap as any)?.off?.()
     }
-  }, [isGeneral, myName])
+  }, [room, roomId, isGeneral, myName])
 
   // Keep a live ref of messages for history sharing
   useEffect(() => {

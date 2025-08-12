@@ -1,37 +1,44 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { selfId } from 'trystero'
-import {joinRoom} from 'trystero/torrent'
+import { selfId, type Room } from 'trystero'
+import { joinRoomWithFallback } from '@/lib/trystero-client'
 
 const config = { appId: 'my_super_react_app' } // Use a unique identifier for your app
 
 function App() {
-  const [room, setRoom] = useState(null)
+  const [room, setRoom] = useState<Room | null>(null)
   const [message, setMessage] = useState('')
   const [chatMessages, setChatMessages] = useState([])
-  const sendChatRef = useRef(null)
+  const sendChatRef = useRef<((m: string) => void) | null>(null)
 
   useEffect(() => {
-    // Join the room (using "chatroom" as the room name)
-    const roomInstance = joinRoom(config, 'chatroom')
-    setRoom(roomInstance)
+    let manager: Awaited<ReturnType<typeof joinRoomWithFallback>> | null = null
 
-    // Create a chat action for sending and receiving messages
-    const [sendChat, getChat] = roomInstance.makeAction('chat')
-    sendChatRef.current = sendChat
+    joinRoomWithFallback(config, 'chatroom').then((mgr) => {
+      manager = mgr
+      setRoom(mgr.room)
 
-    // Listen for incoming chat messages
-    getChat((msg, peerId) => {
-      setChatMessages((prev) => [...prev, { sender: peerId, msg }])
+      const [sendChat, getChat] = mgr.room.makeAction('chat')
+      sendChatRef.current = sendChat
+
+      getChat((msg, peerId) => {
+        setChatMessages((prev) => [...prev, { sender: peerId, msg }])
+      })
+
+      mgr.room.onPeerJoin((peerId) => {
+        console.log(`Peer ${peerId} joined`)
+      })
+
+      mgr.onReconnect((r) => {
+        const [send, get] = r.makeAction('chat')
+        sendChatRef.current = send
+        get((msg, peerId) => {
+          setChatMessages((prev) => [...prev, { sender: peerId, msg }])
+        })
+      })
     })
 
-    // Log when peers join (optional)
-    roomInstance.onPeerJoin((peerId) => {
-      console.log(`Peer ${peerId} joined`)
-    })
-
-    // Cleanup when component unmounts
     return () => {
-      roomInstance.leave()
+      manager?.leave()
     }
   }, [])
 
