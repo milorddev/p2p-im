@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, no-constant-binary-expression, no-empty */
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { selfId, type JsonValue } from "trystero"
 import { useTrysteroRoom } from "@/lib/trystero-client"
 import Gun from "gun"
@@ -61,8 +61,8 @@ import remarkGfm from "remark-gfm"
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
 import { coldarkDark } from "react-syntax-highlighter/dist/esm/styles/prism"
 
-// Initialize a local Gun instance (local-first persistence)
-const gun = Gun()
+// Initialize a local Gun instance (local-first persistence only)
+const gun = Gun({ peers: [], localStorage: true })
 
 // Short action labels (Trystero prefers <= 12 bytes)
 const ACT = {
@@ -92,6 +92,11 @@ type ChatMessage =
       mimeType?: string
       fileName?: string
       fileSize?: number
+      [key: string]: JsonValue
+    })
+  | (BaseMessage & {
+      kind: "system"
+      content: string
       [key: string]: JsonValue
     })
 
@@ -145,8 +150,28 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
   const loadedIds = useRef<Set<string>>(new Set())
   const messagesRef = useRef<ChatMessage[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const joinedRef = useRef<Set<string>>(new Set())
 
-  const sortMessages = (msgs: ChatMessage[]) => msgs.sort((a, b) => a.timestamp - b.timestamp)
+  const sortMessages = useCallback(
+    (msgs: ChatMessage[]) => msgs.sort((a, b) => a.timestamp - b.timestamp),
+    []
+  )
+
+  const addSystemMessage = useCallback(
+    (content: string) => {
+      const ts = Date.now()
+      const msg: ChatMessage = {
+        id: `system-${ts}`,
+        authorId: "System",
+        authorName: "System",
+        timestamp: ts,
+        kind: "system",
+        content,
+      }
+      setMessages((prev) => sortMessages([...prev, msg]))
+    },
+    [sortMessages]
+  )
 
   // resolve room id and establish room with strategy fallbacks
   const url = typeof window !== "undefined" ? new URL(window.location.href) : null
@@ -167,19 +192,8 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
     // Reset in-memory state for a fresh mount
     loadedIds.current = new Set()
 
-    // Backfill updates from Gun (local-first)
+    // Prepare Gun map for realtime updates (listener attached after initial load)
     const gunMap = messagesNode.map()
-    gunMap.on((data: unknown) => {
-      const msg = data as Partial<ChatMessage> | null
-      if (!msg || !msg.id) return // skip invalid
-      const ts = normalizeTimestamp((msg as any).timestamp, msg.id)
-      const complete = { ...msg, timestamp: ts } as ChatMessage
-      if (loadedIds.current.has(complete.id)) return
-      loadedIds.current.add(complete.id)
-      setMessages((prev) => sortMessages([...prev, complete]))
-      // Normalize timestamp back to Gun
-      messagesNode.get(complete.id).put(complete)
-    })
 
     // Trystero actions
     const [sendChat, getChat] = room.makeAction<ChatPayload>(ACT.CHAT)
@@ -229,6 +243,10 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
     getName((name, peerId) => {
       if (!peerId) return
       setPeerNames((prev) => ({ ...prev, [peerId]: name }))
+      if (peerId !== selfId && !joinedRef.current.has(peerId)) {
+        joinedRef.current.add(peerId)
+        addSystemMessage(`${name} joined the chat`)
+      }
     })
 
     // Receive history
@@ -271,7 +289,7 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
       authorId: "System",
       authorName: "System",
       timestamp: Date.now(),
-      kind: "text",
+      kind: "system",
       content: isGeneral ? "Welcome to the community chat" : "Room chat active",
     }
 
@@ -288,6 +306,19 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
       const sorted = sortMessages([welcome, ...initial])
       setMessages(sorted)
       sendHReq(selfId)
+
+      // Start realtime Gun listener after initial history loads
+      gunMap.on((data: unknown) => {
+        const msg = data as Partial<ChatMessage> | null
+        if (!msg || !msg.id) return
+        const ts = normalizeTimestamp((msg as any).timestamp, msg.id)
+        const complete = { ...msg, timestamp: ts } as ChatMessage
+        if (loadedIds.current.has(complete.id)) return
+        loadedIds.current.add(complete.id)
+        setMessages((prev) => sortMessages([...prev, complete]))
+        messagesNode.get(complete.id).put(complete)
+      })
+
       setIsJoining(false)
     })
 
@@ -295,7 +326,7 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
       ;(messagesNode as any)?.off?.()
       ;(gunMap as any)?.off?.()
     }
-  }, [room, roomId, isGeneral, myName])
+  }, [room, roomId, isGeneral, myName, addSystemMessage, sortMessages])
 
   // Keep a live ref of messages for history sharing
   useEffect(() => {
@@ -626,38 +657,33 @@ function MessageList({ messages }: { messages: ChatMessage[] }) {
   return (
     <div className="space-y-3 sm:space-y-4">
       {messages.map((m) => (
-        <MessageBubble key={m.id} message={m} />
+        <MessageRow key={m.id} message={m} />
       ))}
     </div>
   )
 }
 
-function MessageBubble({ message: m }: { message: ChatMessage }) {
+function MessageRow({ message: m }: { message: ChatMessage }) {
+  if (m.kind === "system") {
+    return <div className="text-center text-xs text-emerald-300/60">{m.content}</div>
+  }
   const mine = m.authorId === selfId
   return (
-    <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-      <div
-        className={[
-          "max-w-[85%] rounded-2xl border px-3 py-2 text-sm shadow-sm transition-all duration-200 sm:max-w-[75%] sm:px-4 sm:py-3 md:max-w-[70%]",
-          mine
-            ? "border-emerald-500/40 bg-[#0c1b16]/95 text-emerald-50 shadow-[0_0_20px_rgba(16,185,129,.18)]"
-            : "border-emerald-500/15 bg-[#0b1110]/95 text-emerald-100",
-        ].join(" ")}
-      >
-        <div className="mb-1 flex items-center gap-2 text-[10px] text-emerald-300/80 sm:text-[11px]">
-          <span className="font-mono truncate max-w-[30vw] sm:max-w-[40vw]">{mine ? "you" : m.authorName}</span>
-          <span className="opacity-50">•</span>
-          <span className="tabular-nums">
-            {new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-          </span>
-        </div>
-
-        {m.kind === "text" ? (
-          <MarkdownRenderer text={m.content} />
-        ) : (
-          <FileBubble cid={m.cid} fileName={m.fileName || m.content} mimeType={m.mimeType} fileSize={m.fileSize} />
-        )}
+    <div className="space-y-1">
+      <div className="text-xs text-emerald-300/70">
+        {mine ? `${m.authorName} (You)` : m.authorName} •{" "}
+        {new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </div>
+      {m.kind === "text" ? (
+        <MarkdownRenderer text={m.content} />
+      ) : (
+        <FileBubble
+          cid={m.cid}
+          fileName={m.fileName || m.content}
+          mimeType={m.mimeType}
+          fileSize={m.fileSize}
+        />
+      )}
     </div>
   )
 }
