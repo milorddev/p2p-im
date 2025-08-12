@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, no-constant-binary-expression, no-empty */
 import { useEffect, useMemo, useRef, useState, useCallback } from "react"
-import { selfId, type JsonValue } from "trystero"
+import { selfId } from "trystero"
 import { useTrysteroRoom } from "@/lib/trystero-client"
 import Gun from "gun"
 import {
@@ -23,63 +23,7 @@ import {
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-
-// Helia (IPFS) for file sharing
-import { createHelia, type Helia } from "helia"
-import { unixfs } from "@helia/unixfs"
-import { createLibp2p } from "libp2p"
-import { webTransport } from "@libp2p/webtransport"
-import { webSockets } from "@libp2p/websockets"
-import { bootstrap } from "@libp2p/bootstrap"
-import { delegatedHTTPRouting } from "@helia/routers"
-
-// Optional persistent blockstore (browser IndexedDB)
-let hasIDB = true
-try {
-  hasIDB = typeof indexedDB !== "undefined"
-} catch {
-  hasIDB = false
-}
-
-type IDBBlockstore = any
-
-async function createHeliaNode(): Promise<Helia> {
-  let blockstore: IDBBlockstore | undefined
-  if (hasIDB) {
-    try {
-      // Dynamically import to avoid breaking environments without IDB
-      const { IDBBlockstore } = await import("blockstore-idb")
-      blockstore = new IDBBlockstore("p2p-im-blocks")
-      await blockstore.open()
-    } catch (e) {
-      console.warn("IDB blockstore unavailable, falling back to in-memory:", e)
-    }
-  }
-
-  const libp2p = await createLibp2p({
-    transports: [webTransport(), webSockets()],
-    peerDiscovery: [
-      bootstrap({
-        list: [
-          "/dns4/node0.delegate.ipfs.io/tcp/443/wss/p2p/12D3KooWGaDo7oU5zWxZmfZbduCMsZbxTWdK5vCq1zg9ZDB6wq3J",
-        ],
-      }),
-    ],
-  })
-
-  libp2p.addEventListener("peer:connect", (evt) => {
-    console.log("libp2p connected to", evt.detail.toString())
-  })
-  libp2p.addEventListener("peer:disconnect", (evt) => {
-    console.log("libp2p disconnected from", evt.detail.toString())
-  })
-
-  return await createHelia({
-    blockstore,
-    libp2p,
-    routers: [delegatedHTTPRouting()],
-  })
-}
+import { useHelia } from "@/hooks/useHelia"
 
 // Markdown + syntax highlighting
 import ReactMarkdown from "react-markdown"
@@ -109,21 +53,18 @@ type ChatMessage =
   | (BaseMessage & {
       kind: "text"
       content: string
-      [key: string]: JsonValue
     })
   | (BaseMessage & {
       kind: "file"
       content: string // short description or fileName
       cid: string
-      mimeType?: string
-      fileName?: string
-      fileSize?: number
-      [key: string]: JsonValue
+      mimeType: string
+      fileName: string
+      fileSize: number
     })
   | (BaseMessage & {
       kind: "system"
       content: string
-      [key: string]: JsonValue
     })
 
 type ChatPayload = {
@@ -136,7 +77,6 @@ type ChatPayload = {
   mimeType?: string
   fileName?: string
   fileSize?: number
-  [key: string]: JsonValue
 }
 
 const gatewayFor = (cid: string) => `https://ipfs.io/ipfs/${cid}`
@@ -165,9 +105,10 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
   const [peers, setPeers] = useState<string[]>([])
   const [peerNames, setPeerNames] = useState<Record<string, string>>({})
   const [isJoining, setIsJoining] = useState(true)
-  const [helia, setHelia] = useState<Helia | null>(null)
-  const [isHeliaReady, setIsHeliaReady] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
+
+  const { helia, fs, error: heliaError, starting: heliaStarting } = useHelia()
+  const isHeliaReady = !!helia && !!fs && !heliaError && !heliaStarting
 
   // refs
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -245,9 +186,9 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
               kind: "file",
               content: data.fileName || data.content || "Shared file",
               cid: data.cid,
-              mimeType: data.mimeType,
-              fileName: data.fileName,
-              fileSize: data.fileSize,
+              mimeType: data.mimeType || "application/octet-stream",
+              fileName: data.fileName || "file",
+              fileSize: data.fileSize ?? 0,
             }
           : {
               ...base,
@@ -319,7 +260,7 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
       content: isGeneral ? "Welcome to the community chat" : "Room chat active",
     }
 
-    messagesNode.once((data: Record<string, ChatMessage>) => {
+      ;(messagesNode as any).once((data: Record<string, ChatMessage>) => {
       const initial: ChatMessage[] = []
       Object.entries(data || {}).forEach(([key, value]) => {
         if (key === "_" || !value || !value.id) return
@@ -369,25 +310,6 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
     if (myName) localStorage.setItem("p2p-nickname", myName)
   }, [myName])
 
-  // Init Helia once (browser Helia with IDB-backed blockstore if possible)
-  useEffect(() => {
-    let mounted = true
-    ;(async () => {
-      try {
-        const node = await createHeliaNode()
-        if (!mounted) return
-        setHelia(node)
-        setIsHeliaReady(true)
-      } catch (e) {
-        console.warn("Helia init failed:", e)
-        setIsHeliaReady(false)
-      }
-    })()
-    return () => {
-      mounted = false
-    }
-  }, [])
-
   // Send a text message
   const sendMessage = async () => {
     const content = newMessage.trim()
@@ -423,46 +345,48 @@ export function LiveChat({ isGeneral = false }: { isGeneral?: boolean }) {
 
   // Send files via Helia (IPFS) – accepts an array of File
   const onPickFiles = async (files: File[]) => {
-    if (!helia) return
+    if (!helia || !fs) return
     const images = files.filter((f) => f.type.startsWith("image/"))
     if (!images.length) return
     setIsUploading(true)
     try {
-      const fs = unixfs(helia)
       for (const file of images) {
         try {
           const ab = await file.arrayBuffer()
           const cid = (await fs.addBytes(new Uint8Array(ab))).toV1().toString()
           const ts = Date.now()
           const id = `${ts}-${selfId}`
+          const mimeType = file.type || "application/octet-stream"
+          const fileName = file.name
+          const fileSize = file.size
 
-          const msg: ChatMessage = {
+          const msg = {
             id,
             authorId: selfId,
             authorName: myName,
             timestamp: ts,
-            kind: "file",
-            content: file.name || "Shared file",
+            kind: "file" as const,
+            content: fileName || "Shared file",
             cid,
-            mimeType: file.type || "application/octet-stream",
-            fileName: file.name,
-            fileSize: file.size,
-          }
+            mimeType,
+            fileName,
+            fileSize,
+          } as unknown as ChatMessage
 
           loadedIds.current.add(msg.id)
           setMessages((prev) => sortMessages([...prev, msg]))
 
-          const payload: ChatPayload = {
+          const payload = {
             id,
             timestamp: ts,
             name: myName,
-            content: file.name || "Shared file",
-            kind: "file",
+            content: fileName || "Shared file",
+            kind: "file" as const,
             cid,
-            mimeType: msg.mimeType,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-          }
+            mimeType,
+            fileName,
+            fileSize,
+          } as ChatPayload
           try {
             await sendChatRef.current?.(payload)
           } catch (e) {

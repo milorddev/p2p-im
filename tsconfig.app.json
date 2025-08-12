@@ -31,5 +31,5 @@
     }
   },
   "include": ["src"],
-  "exclude": ["src/lexicon/**/*"]
+  "exclude": ["src/lexicon/**/*", "src/App.tsx"]
 }
